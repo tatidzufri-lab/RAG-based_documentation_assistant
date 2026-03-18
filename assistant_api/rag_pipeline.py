@@ -33,13 +33,12 @@ class RAGPipeline:
             raise ValueError("OPENAI_API_KEY не установлен")
         
         self.model = model
+        self.data_path = data_path
         self.openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
         
-        # Инициализация компонентов
         print("Инициализация векторного хранилища...")
         self.vector_store = VectorStore(collection_name=collection_name)
         
-        # Загрузка документов, если коллекция пустая
         if self.vector_store.collection.count() == 0:
             print(f"Загрузка документов из директории {data_path}...")
             self.vector_store.load_documents_from_directory(data_path)
@@ -48,6 +47,24 @@ class RAGPipeline:
         self.cache = RAGCache(db_path=cache_db_path)
         
         print("RAG Pipeline инициализирован (API mode)")
+    
+    def reindex(self):
+        """Переиндексация: удаление коллекции, повторная загрузка документов и очистка кеша."""
+        col_name = self.vector_store.collection_name
+        print(f"Переиндексация '{col_name}'...")
+        
+        self.vector_store.client.delete_collection(name=col_name)
+        self.vector_store.collection = self.vector_store.client.create_collection(
+            name=col_name,
+            metadata={"hnsw:space": "cosine"}
+        )
+        
+        self.vector_store.load_documents_from_directory(self.data_path)
+        self.cache.clear()
+        
+        count = self.vector_store.collection.count()
+        print(f"Переиндексация завершена. Документов: {count}")
+        return count
     
     def _create_prompt(self, query: str, context_docs: List[Dict[str, Any]]) -> str:
         """

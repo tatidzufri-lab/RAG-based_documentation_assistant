@@ -7,6 +7,7 @@ import requests
 import os
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
+from pathlib import Path
 import json
 
 
@@ -32,6 +33,10 @@ class GigaChatClient:
         self.oauth_url = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
         self.api_url = "https://gigachat.devices.sberbank.ru/api/v1"
         
+        # Путь к сертификату для SSL-верификации
+        cert_path = Path(__file__).parent / "russiantrustedca.pem"
+        self.verify_ssl = str(cert_path) if cert_path.exists() else False
+        
         self.access_token = None
         self.token_expires_at = None
         
@@ -53,7 +58,7 @@ class GigaChatClient:
                 self.oauth_url,
                 headers=headers,
                 data=payload,
-                verify=False  # Для работы с сертификатом Сбера
+                verify=self.verify_ssl
             )
             response.raise_for_status()
             
@@ -112,7 +117,7 @@ class GigaChatClient:
                 url,
                 headers=self._get_headers(),
                 json=payload,
-                verify=False
+                verify=self.verify_ssl
             )
             response.raise_for_status()
             
@@ -145,29 +150,43 @@ class GigaChatClient:
                 url,
                 headers=self._get_headers(),
                 json=payload,
-                verify=False
+                verify=self.verify_ssl
             )
             response.raise_for_status()
             
             data = response.json()
-            return [item['embedding'] for item in data['data']]
+            embeddings = [item['embedding'] for item in data['data']]
+            
+            if not hasattr(self, '_embedding_dim'):
+                self._embedding_dim = len(embeddings[0])
+                print(f"  Размерность эмбеддингов GigaChat: {self._embedding_dim}")
+            
+            return embeddings
             
         except Exception as e:
-            # Если embeddings API недоступен, используем заглушку
-            print(f"⚠️  Embeddings API недоступен, используется fallback: {e}")
-            # Возвращаем простые хеш-based embeddings как fallback
-            import hashlib
-            embeddings = []
-            for text in texts:
-                # Создаем простой 768-мерный вектор из хеша
-                hash_obj = hashlib.sha256(text.encode())
-                hash_bytes = hash_obj.digest()
-                # Расширяем до 768 измерений
-                vector = []
-                for i in range(768):
-                    vector.append((hash_bytes[i % len(hash_bytes)] / 255.0) - 0.5)
-                embeddings.append(vector)
-            return embeddings
+            print(f"Embeddings API недоступен: {e}")
+            print("  Повторная попытка через новый токен...")
+            try:
+                self._refresh_token()
+                response = requests.post(
+                    url,
+                    headers=self._get_headers(),
+                    json=payload,
+                    verify=self.verify_ssl
+                )
+                response.raise_for_status()
+                data = response.json()
+                embeddings = [item['embedding'] for item in data['data']]
+                
+                if not hasattr(self, '_embedding_dim'):
+                    self._embedding_dim = len(embeddings[0])
+                    print(f"  Размерность эмбеддингов GigaChat: {self._embedding_dim}")
+                
+                return embeddings
+            except Exception as e2:
+                raise Exception(
+                    f"GigaChat Embeddings API недоступен после повторной попытки: {e2}"
+                )
     
     def get_models(self) -> List[Dict[str, Any]]:
         """
@@ -182,7 +201,7 @@ class GigaChatClient:
             response = requests.get(
                 url,
                 headers=self._get_headers(),
-                verify=False
+                verify=self.verify_ssl
             )
             response.raise_for_status()
             

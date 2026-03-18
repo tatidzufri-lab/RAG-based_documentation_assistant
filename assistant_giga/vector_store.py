@@ -24,22 +24,66 @@ class VectorStore:
         self.collection_name = collection_name
         self.persist_directory = persist_directory
         
+        # GigaChat клиент для создания embeddings (инициализируем ДО ChromaDB,
+        # чтобы знать размерность эмбеддингов для проверки коллекции)
+        self.gigachat_client = GigaChatClient()
+        
         # Инициализация ChromaDB клиента
         self.client = chromadb.PersistentClient(path=persist_directory)
         
         # Получение или создание коллекции
-        try:
-            self.collection = self.client.get_collection(name=collection_name)
-            print(f"Коллекция '{collection_name}' загружена. Документов: {self.collection.count()}")
-        except Exception:
-            self.collection = self.client.create_collection(
+        self.collection = self._init_collection(collection_name)
+    
+    def _init_collection(self, collection_name: str):
+        """Инициализация коллекции с проверкой размерности эмбеддингов."""
+        existing_collections = [c.name for c in self.client.list_collections()]
+        
+        if collection_name not in existing_collections:
+            print(f"Создана новая коллекция '{collection_name}'")
+            return self.client.create_collection(
                 name=collection_name,
                 metadata={"hnsw:space": "cosine"}
             )
-            print(f"Создана новая коллекция '{collection_name}'")
         
-        # GigaChat клиент для создания embeddings
-        self.gigachat_client = GigaChatClient()
+        collection = self.client.get_collection(name=collection_name)
+        doc_count = collection.count()
+        
+        if doc_count == 0:
+            print(f"Коллекция '{collection_name}' загружена. Документов: 0")
+            return collection
+        
+        # Проверяем размерность: сравниваем хранимые эмбеддинги с API
+        needs_recreate = False
+        try:
+            sample = collection.peek(limit=1)
+            embeddings = sample.get('embeddings') if sample else None
+            has_embeddings = embeddings is not None and len(embeddings) > 0
+            
+            if has_embeddings:
+                stored_dim = len(embeddings[0])
+                test_emb = self.gigachat_client.get_embeddings(["test"])
+                api_dim = len(test_emb[0])
+                
+                if stored_dim != api_dim:
+                    print(f"Несовпадение размерности: коллекция={stored_dim}, API={api_dim}")
+                    needs_recreate = True
+        except Exception as e:
+            print(f"Ошибка при проверке размерности: {e}")
+            print("Пересоздание коллекции для безопасности...")
+            needs_recreate = True
+        
+        if needs_recreate:
+            print(f"Пересоздание коллекции '{collection_name}'...")
+            self.client.delete_collection(name=collection_name)
+            collection = self.client.create_collection(
+                name=collection_name,
+                metadata={"hnsw:space": "cosine"}
+            )
+            print(f"Коллекция пересоздана")
+            return collection
+        
+        print(f"Коллекция '{collection_name}' загружена. Документов: {doc_count}")
+        return collection
     
     def _chunk_text(self, text: str, chunk_size: int = 500, overlap: int = 100) -> List[str]:
         """
@@ -196,54 +240,100 @@ class VectorStore:
         
         return chunks
     
-    def load_documents(self, file_path: str):
+    def load_documents(self, file_path: str, source_name: str = None):
         """
         Загрузка документов из файла в векторное хранилище.
         
         Args:
             file_path: путь к файлу с документами
+            source_name: имя файла-источника для метаданных
         """
-        # Проверка существования файла
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"Файл {file_path} не найден")
         
-        # Чтение файла
+        if source_name is None:
+            source_name = os.path.basename(file_path)
+        
         with open(file_path, 'r', encoding='utf-8') as f:
             text = f.read()
         
-        # Разбиение на чанки
         chunks = self._chunk_text(text)
-        print(f"Текст разбит на {len(chunks)} чанков")
+        print(f"Текст из '{source_name}' разбит на {len(chunks)} чанков")
         
-        # Проверка, не загружены ли уже документы
-        if self.collection.count() > 0:
-            print("Документы уже загружены в коллекцию")
+        if len(chunks) == 0:
+            print(f"Предупреждение: файл '{source_name}' не содержит текста для обработки")
             return
         
-        # Создание embeddings и добавление в ChromaDB
         documents = []
         ids = []
         embeddings = []
+        metadatas = []
+        
+        base_count = self.collection.count()
         
         for i, chunk in enumerate(chunks):
-            # Создание embedding через OpenAI
             embedding = self._create_embedding(chunk)
             
             documents.append(chunk)
-            ids.append(f"doc_{i}")
+            ids.append(f"{source_name}_chunk_{base_count + i}")
             embeddings.append(embedding)
+            metadatas.append({"source": source_name})
             
             if (i + 1) % 10 == 0:
-                print(f"Обработано {i + 1}/{len(chunks)} чанков")
+                print(f"Обработано {i + 1}/{len(chunks)} чанков из '{source_name}'")
         
-        # Добавление в ChromaDB батчами
         self.collection.add(
             documents=documents,
             embeddings=embeddings,
-            ids=ids
+            ids=ids,
+            metadatas=metadatas
         )
         
-        print(f"Загружено {len(chunks)} документов в коллекцию '{self.collection_name}'")
+        print(f"Загружено {len(chunks)} чанков из '{source_name}' в коллекцию '{self.collection_name}'")
+    
+    def load_documents_from_directory(self, directory_path: str):
+        """
+        Загрузка всех .txt файлов из директории в векторное хранилище.
+        
+        Args:
+            directory_path: путь к директории с .txt файлами
+        """
+        if not os.path.exists(directory_path):
+            raise FileNotFoundError(f"Директория {directory_path} не найдена")
+        
+        if not os.path.isdir(directory_path):
+            raise ValueError(f"{directory_path} не является директорией")
+        
+        txt_files = []
+        for file_name in os.listdir(directory_path):
+            if file_name.endswith('.txt'):
+                file_path = os.path.join(directory_path, file_name)
+                if os.path.isfile(file_path):
+                    txt_files.append((file_path, file_name))
+        
+        if len(txt_files) == 0:
+            print(f"Предупреждение: в директории '{directory_path}' не найдено .txt файлов")
+            return
+        
+        print(f"Найдено {len(txt_files)} .txt файлов в директории '{directory_path}'")
+        
+        loaded_count = 0
+        skipped_count = 0
+        
+        for file_path, file_name in txt_files:
+            try:
+                print(f"\nОбработка файла: {file_name}")
+                self.load_documents(file_path, source_name=file_name)
+                loaded_count += 1
+            except Exception as e:
+                print(f"[!] Пропущен файл '{file_name}': {e}")
+                skipped_count += 1
+        
+        print(f"\n{'='*60}")
+        print(f"Загрузка завершена:")
+        print(f"  Успешно загружено: {loaded_count} файлов")
+        print(f"  Пропущено: {skipped_count} файлов")
+        print(f"{'='*60}")
     
     def _create_embedding(self, text: str) -> List[float]:
         """

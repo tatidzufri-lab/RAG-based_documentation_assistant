@@ -17,7 +17,7 @@ class RAGPipeline:
     def __init__(self, 
                  collection_name: str = "rag_collection",
                  cache_db_path: str = "rag_cache.db",
-                 data_file: str = "data/docs.txt",
+                 data_path: str = "data",
                  model: str = "GigaChat"):
         """
         Инициализация RAG pipeline.
@@ -25,31 +25,47 @@ class RAGPipeline:
         Args:
             collection_name: имя коллекции в ChromaDB
             cache_db_path: путь к базе данных кеша
-            data_file: путь к файлу с документами
+            data_path: путь к директории с .txt документами
             model: модель GigaChat для генерации ответов
         """
-        # Проверка ключей
         if not os.getenv("GIGACHAT_AUTH_KEY"):
             raise ValueError("GIGACHAT_AUTH_KEY не установлен")
         if not os.getenv("GIGACHAT_RQUID"):
             raise ValueError("GIGACHAT_RQUID не установлен")
         
         self.model = model
+        self.data_path = data_path
         self.gigachat_client = GigaChatClient()
         
-        # Инициализация компонентов
         print("Инициализация векторного хранилища...")
         self.vector_store = VectorStore(collection_name=collection_name)
         
-        # Загрузка документов, если коллекция пустая
         if self.vector_store.collection.count() == 0:
-            print(f"Загрузка документов из {data_file}...")
-            self.vector_store.load_documents(data_file)
+            print(f"Загрузка документов из директории {data_path}...")
+            self.vector_store.load_documents_from_directory(data_path)
         
         print("Инициализация кеша...")
         self.cache = RAGCache(db_path=cache_db_path)
         
         print("RAG Pipeline инициализирован (GigaChat)")
+    
+    def reindex(self):
+        """Переиндексация: удаление коллекции, повторная загрузка документов и очистка кеша."""
+        col_name = self.vector_store.collection_name
+        print(f"Переиндексация '{col_name}'...")
+        
+        self.vector_store.client.delete_collection(name=col_name)
+        self.vector_store.collection = self.vector_store.client.create_collection(
+            name=col_name,
+            metadata={"hnsw:space": "cosine"}
+        )
+        
+        self.vector_store.load_documents_from_directory(self.data_path)
+        self.cache.clear()
+        
+        count = self.vector_store.collection.count()
+        print(f"Переиндексация завершена. Документов: {count}")
+        return count
     
     
     def _create_prompt(self, query: str, context_docs: List[Dict[str, Any]]) -> str:

@@ -56,6 +56,7 @@ Thumbs.db
 
 # Logs
 *.log
+logs_*.csv
 
 # Jupyter Notebook
 .ipynb_checkpoints
